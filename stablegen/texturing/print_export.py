@@ -388,10 +388,116 @@ class StableGenClearQuantizationPreview(bpy.types.Operator):
                             except Exception:
                                 pass
                             
+def _generate_blue_noise_tile(size=64, seed=42):
+    """Generate a toroidal blue noise threshold tile via FFT spectral shaping.
+
+    Produces a seamlessly-tiling ``size``×``size`` float32 matrix with values
+    uniformly distributed in [0, 1) and blue-noise spatial structure (energy
+    concentrated in high frequencies, no clumping).  Used for ordered spatial
+    dithering to break up visible banding on flat surfaces.
+    """
+    import numpy as np
+    rng = np.random.RandomState(seed)
+
+    noise = rng.rand(size, size).astype(np.float64)
+
+    F = np.fft.fft2(noise)
+    F_shifted = np.fft.fftshift(F)
+
+    cy, cx = size // 2, size // 2
+    yy, xx = np.mgrid[0:size, 0:size]
+    dist = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2)
+    dist_norm = dist / (size * 0.5)
+    hp_filter = dist_norm ** 1.5
+
+    F_filtered = F_shifted * hp_filter
+    result = np.real(np.fft.ifft2(np.fft.ifftshift(F_filtered)))
+
+    flat = result.ravel()
+    order = flat.argsort()
+    ranks = np.empty(size * size, dtype=np.float64)
+    ranks[order] = np.arange(size * size, dtype=np.float64) / (size * size)
+
+    return ranks.reshape(size, size).astype(np.float32)
+
+
+def _subdivide_triangle_barycentric(tri, n_div):
+    """Subdivide a triangle into ``n_div``² sub-triangles via a barycentric grid.
+
+    ``tri`` is a list of 3 vertices, each a list of 3 float coords.  Returns a
+    list of sub-triangles in the same format.  When ``n_div <= 1`` the original
+    triangle is returned unchanged.
+    """
+    if n_div <= 1:
+        return [tri]
+    v0, v1, v2 = tri[0], tri[1], tri[2]
+    sub = []
+    inv = 1.0 / n_div
+    for i in range(n_div):
+        for j in range(n_div - i):
+            k = n_div - i - j
+            p00 = [(i * v0[c] + j * v1[c] + k * v2[c]) * inv for c in range(3)]
+            p10 = [((i + 1) * v0[c] + j * v1[c] + (k - 1) * v2[c]) * inv for c in range(3)]
+            p01 = [(i * v0[c] + (j + 1) * v1[c] + (k - 1) * v2[c]) * inv for c in range(3)]
+            sub.append([p00, p10, p01])
+            if k > 1:
+                p11 = [((i + 1) * v0[c] + (j + 1) * v1[c] + (k - 2) * v2[c]) * inv for c in range(3)]
+                sub.append([p10, p11, p01])
+    return sub
+
+
+def _bn_pick_filament(t_val, cum, n_channels, li_fallback):
+    """Select filament index from a blue noise threshold via the demand CDF."""
+    if cum is None:
+        return li_fallback % n_channels
+    fi = 0
+    for ch in range(n_channels - 1):
+        if t_val >= cum[ch]:
+            fi = ch + 1
+        else:
+            break
+    return fi
+
+
+def _bn_assign_tri(tri, ox, oy, bn_tile, bn_size, bn_scale, cum, n_channels, li_fallback,
+                   max_div=16, target_area=1.0):
+    """Assign filament(s) to a triangle via blue noise dithering.
+
+    Large triangles (XY projection area > ``target_area`` mm²) are subdivided
+    barycentrically so that each sub-triangle receives an independent blue-noise
+    sample.  Returns a list of ``(sub_tri, filament_idx)`` tuples.
+    """
+    v0, v1, v2 = tri[0], tri[1], tri[2]
+    area_2d = abs((v1[0] - v0[0]) * (v2[1] - v0[1]) - (v1[1] - v0[1]) * (v2[0] - v0[0])) * 0.5
+
+    if area_2d > target_area:
+        n_div = min(int(math.sqrt(area_2d / target_area)) + 1, max_div)
+        if n_div > 1:
+            fine_tris = _subdivide_triangle_barycentric(tri, n_div)
+            results = []
+            for ft in fine_tris:
+                cx_s = (ft[0][0] + ft[1][0] + ft[2][0]) / 3.0
+                cy_s = (ft[0][1] + ft[1][1] + ft[2][1]) / 3.0
+                t_val = float(bn_tile[int(cx_s * bn_scale + ox) % bn_size,
+                                      int(cy_s * bn_scale + oy) % bn_size])
+                fi = _bn_pick_filament(t_val, cum, n_channels, li_fallback)
+                results.append((ft, fi))
+            return results
+
+    cx_s = (v0[0] + v1[0] + v2[0]) / 3.0
+    cy_s = (v0[1] + v1[1] + v2[1]) / 3.0
+    t_val = float(bn_tile[int(cx_s * bn_scale + ox) % bn_size,
+                          int(cy_s * bn_scale + oy) % bn_size])
+    fi = _bn_pick_filament(t_val, cum, n_channels, li_fallback)
+    return [(tri, fi)]
+
+
 def _preview_sliced_worker(all_raw_verts, all_raw_tris, face_colors_srgb, unique_keys, unique_colors_arr,
                        palette_rgbs, mode, channel_indices, h_target, LH, n_layers, cyan_idx, n_channels,
                        z_min, scale_factor, is_dithered, chroma_threshold, smoothing_passes, status,
-                       solver_settings=None):
+                       solver_settings=None, dither_method='Z_SEQUENCE',
+                       single_filament_internal=False, internal_visibility_threshold=0.01,
+                       face_visibility=None):
     try:
         import numpy as np
         import math
@@ -453,82 +559,151 @@ def _preview_sliced_worker(all_raw_verts, all_raw_tris, face_colors_srgb, unique
                         return
                     r, g, b = round(color[0] * 255.0), round(color[1] * 255.0), round(color[2] * 255.0)
                     demands[idx] = decompose_subtractive(r, g, b, mode, palette_rgbs, channel_indices)
-            
-            status["stage"] = "Generating color sequences"
-            status["progress"] = 30.0
-            
-            color_seqs = {}
             unique_colors_set2 = [tuple(round(c * 255.0) for c in color) for color in unique_colors_arr]
-            for idx, color_key in enumerate(unique_colors_set2):
-                if status.get("cancel_requested", False):
-                    return
-                row = demands[idx]
-                total = sum(max(0.0, d) for d in row)
-                seq = [0] * n_layers
-                if total < 0.001:
-                    if cyan_idx >= 0:
-                        nc = min(3, n_channels - cyan_idx)
-                        for li in range(n_layers):
-                            seq[li] = cyan_idx + (li % nc)
+
+            if dither_method == 'BLUE_NOISE':
+                status["stage"] = "Building blue noise dither data"
+                status["progress"] = 30.0
+
+                blue_noise_tile = _generate_blue_noise_tile(128)
+                bn_size = blue_noise_tile.shape[0]
+                bn_scale = 4.0
+                _off_rng = np.random.RandomState(98765)
+                layer_ox = _off_rng.randint(0, bn_size, size=n_layers).tolist()
+                layer_oy = _off_rng.randint(0, bn_size, size=n_layers).tolist()
+
+                color_cumdemands = {}
+                for idx, color_key in enumerate(unique_colors_set2):
+                    if status.get("cancel_requested", False):
+                        return
+                    row = demands[idx]
+                    total = sum(max(0.0, d) for d in row)
+                    if total < 0.001:
+                        color_cumdemands[color_key] = None
                     else:
+                        cum = []
+                        s = 0.0
+                        for d in row:
+                            s += max(0.0, d) / total
+                            cum.append(s)
+                        cum[-1] = 1.0
+                        color_cumdemands[color_key] = cum
+            else:
+                status["stage"] = "Generating color sequences"
+                status["progress"] = 30.0
+
+                color_seqs = {}
+                for idx, color_key in enumerate(unique_colors_set2):
+                    if status.get("cancel_requested", False):
+                        return
+                    row = demands[idx]
+                    total = sum(max(0.0, d) for d in row)
+                    seq = [0] * n_layers
+
+                    if total < 0.001:
+                        if cyan_idx >= 0:
+                            nc = min(3, n_channels - cyan_idx)
+                            for li in range(n_layers):
+                                seq[li] = cyan_idx + (li % nc)
+                        else:
+                            for li in range(n_layers):
+                                seq[li] = li % n_channels
+                    else:
+                        frac = [max(0.0, d) / total for d in row]
+                        placed = [0] * n_channels
                         for li in range(n_layers):
-                            seq[li] = li % n_channels
-                else:
-                    frac = [max(0.0, d) / total for d in row]
-                    placed = [0] * n_channels
-                    for li in range(n_layers):
-                        best_ch = 0
-                        best_d = -float('inf')
-                        for ch in range(n_channels):
-                            if frac[ch] < 0.001:
-                                continue
-                            d = frac[ch] * (li + 1) - placed[ch]
-                            tie_break = d + ch * 1e-6 + (1e-7 if li % n_channels == ch else 0.0)
-                            if tie_break > best_d:
-                                best_d = tie_break
-                                best_ch = ch
-                        seq[li] = best_ch
-                        placed[best_ch] += 1
-                color_seqs[color_key] = seq
-            
+                            best_ch = 0
+                            best_d = -float('inf')
+                            for ch in range(n_channels):
+                                if frac[ch] < 0.001:
+                                    continue
+                                d = frac[ch] * (li + 1) - placed[ch]
+                                tie_break = d + ch * 1e-6 + (1e-7 if li % n_channels == ch else 0.0)
+                                if tie_break > best_d:
+                                    best_d = tie_break
+                                    best_ch = ch
+                            seq[li] = best_ch
+                            placed[best_ch] += 1
+                    color_seqs[color_key] = seq
+
             status["stage"] = "Clipping triangles crossing layers"
             status["progress"] = 50.0
-            
+
             clipped_tris = []
             ZOFF = LH / 2
-            
+
             total_tris_count = len(all_raw_tris)
             for fi in range(total_tris_count):
                 if status.get("cancel_requested", False):
                     return
                 if fi % max(1, total_tris_count // 10) == 0:
                     status["progress"] = 50.0 + (fi / total_tris_count) * 30.0
-                
+
                 t_idx = all_raw_tris[fi]
                 v1, v2, v3 = scaled_verts[t_idx[0]], scaled_verts[t_idx[1]], scaled_verts[t_idx[2]]
                 fz_min = min(v1[2], v2[2], v3[2])
                 fz_max = max(v1[2], v2[2], v3[2])
                 tri = [list(v1), list(v2), list(v3)]
-                
+
                 li_start = max(0, int(math.floor((fz_min - ZOFF) / LH)))
                 li_end = min(n_layers - 1, int(math.ceil((fz_max - ZOFF) / LH)))
-                
+
                 color_key = unique_keys[fi]
-                seq = color_seqs[color_key]
-                
-                if li_start == li_end or li_start >= n_layers:
-                    cz = (fz_min + fz_max) / 2
-                    li2 = max(0, min(n_layers - 1, int(math.floor((cz - ZOFF) / LH))))
-                    clipped_tris.append((tri, seq[li2]))
+
+                if single_filament_internal and face_visibility is not None and fi < len(face_visibility) and face_visibility[fi] < internal_visibility_threshold:
+                    internal_fi = n_channels - 1
+                    if li_start == li_end or li_start >= n_layers:
+                        cz_c = (fz_min + fz_max) / 2
+                        li2 = max(0, min(n_layers - 1, int(math.floor((cz_c - ZOFF) / LH))))
+                        clipped_tris.append((tri, internal_fi))
+                    else:
+                        for li in range(li_start, li_end + 1):
+                            if li >= n_layers:
+                                break
+                            zB = ZOFF + li * LH
+                            zT = ZOFF + (li + 1) * LH
+                            for st in cTZ(tri, zB, zT):
+                                clipped_tris.append((st, internal_fi))
+                    continue
+
+                if dither_method == 'BLUE_NOISE':
+                    cum = color_cumdemands.get(color_key)
+                    if li_start == li_end or li_start >= n_layers:
+                        cz = (fz_min + fz_max) / 2
+                        li2 = max(0, min(n_layers - 1, int(math.floor((cz - ZOFF) / LH))))
+                        for ft, fi in _bn_assign_tri(tri, layer_ox[li2], layer_oy[li2],
+                                                      blue_noise_tile, bn_size, bn_scale,
+                                                      cum, n_channels, li2):
+                            clipped_tris.append((ft, fi))
+                    else:
+                        for li in range(li_start, li_end + 1):
+                            if li >= n_layers:
+                                break
+                            zB = ZOFF + li * LH
+                            zT = ZOFF + (li + 1) * LH
+                            sub_tris = cTZ(tri, zB, zT)
+                            ox = layer_ox[li]
+                            oy = layer_oy[li]
+                            for st in sub_tris:
+                                for ft, fi in _bn_assign_tri(st, ox, oy,
+                                                              blue_noise_tile, bn_size, bn_scale,
+                                                              cum, n_channels, li):
+                                    clipped_tris.append((ft, fi))
                 else:
-                    for li in range(li_start, li_end + 1):
-                        if li >= n_layers:
-                            break
-                        zB = ZOFF + li * LH
-                        zT = ZOFF + (li + 1) * LH
-                        sub_tris = cTZ(tri, zB, zT)
-                        for st in sub_tris:
-                            clipped_tris.append((st, seq[li]))
+                    seq = color_seqs[color_key]
+                    if li_start == li_end or li_start >= n_layers:
+                        cz = (fz_min + fz_max) / 2
+                        li2 = max(0, min(n_layers - 1, int(math.floor((cz - ZOFF) / LH))))
+                        clipped_tris.append((tri, seq[li2]))
+                    else:
+                        for li in range(li_start, li_end + 1):
+                            if li >= n_layers:
+                                break
+                            zB = ZOFF + li * LH
+                            zT = ZOFF + (li + 1) * LH
+                            sub_tris = cTZ(tri, zB, zT)
+                            for st in sub_tris:
+                                clipped_tris.append((st, seq[li]))
             
             status["stage"] = "Welding coplanar slice vertices"
             status["progress"] = 80.0
@@ -666,6 +841,8 @@ class StableGenPreviewSliced(bpy.types.Operator):
             t_idx = np.empty(len(temp.loop_triangles) * 3, dtype=np.int32)
             temp.loop_triangles.foreach_get("vertices", t_idx)
             all_raw_tris = t_idx.reshape((-1, 3))
+
+            face_visibility = _collect_face_visibility(temp)
         finally:
             eval_obj.to_mesh_clear()
 
@@ -697,6 +874,9 @@ class StableGenPreviewSliced(bpy.types.Operator):
         scale_factor = h_target / h_blender
 
         is_dithered = getattr(scene, "stablegen_print_dithered", True)
+        dither_method = getattr(scene, "stablegen_print_dither_method", "Z_SEQUENCE")
+        single_filament_internal = getattr(scene, "stablegen_print_single_filament_internal", True)
+        internal_visibility_threshold = getattr(scene, "stablegen_print_internal_visibility_threshold", 0.01)
         chroma_threshold = getattr(scene, "stablegen_print_chroma_threshold", 0.35)
         smoothing_passes = getattr(scene, "stablegen_print_smoothing", 2)
 
@@ -721,7 +901,8 @@ class StableGenPreviewSliced(bpy.types.Operator):
                 all_raw_verts, all_raw_tris, face_colors_srgb, unique_keys, unique_colors_arr,
                 palette_rgbs, mode, channel_indices, h_target, LH, n_layers, cyan_idx, n_channels,
                 z_min, scale_factor, is_dithered, chroma_threshold, smoothing_passes, self._thread_status,
-                solver_settings
+                solver_settings, dither_method, single_filament_internal, internal_visibility_threshold,
+                face_visibility
             ),
             daemon=True
         )
@@ -1691,7 +1872,107 @@ def _collect_face_colors(mesh, image):
 
 
 
-def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None):
+def _keep_largest_island(bm):
+    """Keep only the largest connected face component of ``bm`` (by surface area).
+
+    Two faces are considered connected when they share at least one edge. All
+    non-largest components are deleted with ``context='FACES'`` and the loose
+    edges/verts left behind are also removed.
+
+    Returns ``(n_components, n_removed_faces, removed_area)`` for diagnostics.
+    """
+    from collections import defaultdict
+    import bmesh
+
+    if not bm.faces:
+        return 0, 0, 0.0
+
+    adj = defaultdict(list)
+    for e in bm.edges:
+        lf = e.link_faces
+        if len(lf) < 2:
+            continue
+        a = lf[0]
+        for b in lf[1:]:
+            adj[a].append(b)
+            adj[b].append(a)
+
+    unvisited = set(bm.faces)
+    components = []
+
+    while unvisited:
+        seed = next(iter(unvisited))
+        unvisited.discard(seed)
+        comp_faces = [seed]
+        comp_area = seed.calc_area()
+        stack = [seed]
+        while stack:
+            f = stack.pop()
+            for nb in adj.get(f, ()):
+                if nb in unvisited:
+                    unvisited.discard(nb)
+                    comp_faces.append(nb)
+                    comp_area += nb.calc_area()
+                    stack.append(nb)
+        components.append((comp_area, comp_faces))
+
+    n_components = len(components)
+    if n_components <= 1:
+        return n_components, 0, 0.0
+
+    largest_idx = max(range(n_components), key=lambda i: components[i][0])
+    to_delete = []
+    removed_area = 0.0
+    for i, (area, faces_list) in enumerate(components):
+        if i == largest_idx:
+            continue
+        to_delete.extend(faces_list)
+        removed_area += area
+
+    if to_delete:
+        bmesh.ops.delete(bm, geom=to_delete, context='FACES')
+        loose_edges = [e for e in bm.edges if not e.link_faces]
+        if loose_edges:
+            bmesh.ops.delete(bm, geom=loose_edges, context='EDGES')
+        loose_verts = [v for v in bm.verts if not v.link_edges]
+        if loose_verts:
+            bmesh.ops.delete(bm, geom=loose_verts, context='VERTS')
+
+    return n_components, len(to_delete), removed_area
+
+
+def _collect_face_visibility(mesh):
+    """Collect per-face visibility from ``_SG_VisWeight_*`` mesh attributes.
+
+    Sums all per-vertex visibility weight attributes (one per texturing camera)
+    and averages per triangle via ``loop_triangles``.  Returns a NumPy float32
+    array of shape ``(n_tris,)`` or ``None`` when no visibility attributes exist.
+    """
+    import numpy as np
+
+    vis_attrs = [attr for attr in mesh.attributes
+                 if attr.name.startswith("_SG_VisWeight_") and attr.domain == 'POINT']
+    if not vis_attrs:
+        return None
+
+    n_verts = len(mesh.vertices)
+    total = np.zeros(n_verts, dtype=np.float32)
+    for attr in vis_attrs:
+        vals = np.empty(n_verts, dtype=np.float32)
+        attr.data.foreach_get("value", vals)
+        total += vals
+
+    n_tris = len(mesh.loop_triangles)
+    tri_verts = np.empty(n_tris * 3, dtype=np.int32)
+    mesh.loop_triangles.foreach_get("vertices", tri_verts)
+    tri_verts = tri_verts.reshape((-1, 3))
+
+    face_vis = total[tri_verts].mean(axis=1)
+    return face_vis
+
+
+def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None, keep_largest_island=False,
+                            face_visibility=None):
     import bmesh
     from mathutils.bvhtree import BVHTree
     import numpy as np
@@ -1848,6 +2129,28 @@ def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None):
         bm.verts.ensure_lookup_table()
         print(f"[StableGen Make Solid] Deleted invisible geometry in {time.perf_counter() - t0:.4f}s")
         
+        if keep_largest_island:
+            t0 = time.perf_counter()
+            bm.faces.ensure_lookup_table()
+            bm.edges.ensure_lookup_table()
+            bm.verts.ensure_lookup_table()
+            n_comp, n_rm, area_rm = _keep_largest_island(bm)
+            if n_rm > 0:
+                bm.faces.ensure_lookup_table()
+                bm.edges.ensure_lookup_table()
+                bm.verts.ensure_lookup_table()
+            print(f"[StableGen Make Solid] Kept largest island: {n_comp} components found, "
+                  f"removed {n_rm} faces ({area_rm:.4f} area) in {time.perf_counter() - t0:.4f}s")
+
+        # Build centroid → visibility dict for surviving faces (before fill_gaps)
+        vis_centers = None
+        if face_visibility is not None:
+            vis_centers = {}
+            for f in bm.faces:
+                if f.index < len(face_visibility):
+                    key = tuple(round(c, 4) for c in f.calc_center_median())
+                    vis_centers[key] = float(face_visibility[f.index])
+
         if fill_gaps:
             t0 = time.perf_counter()
             visible_centers = {tuple(round(c, 4) for c in f.calc_center_median()) for f in bm.faces}
@@ -1972,7 +2275,19 @@ def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None):
         solid_mesh = bpy.data.meshes.new(f"{obj.name}_solid")
         bm.to_mesh(solid_mesh)
         bm.free()
-        
+
+        if vis_centers is not None:
+            import numpy as np
+            n_faces = len(solid_mesh.polygons)
+            vis_vals = np.zeros(n_faces, dtype=np.float32)
+            for i in range(n_faces):
+                c = solid_mesh.polygons[i].center
+                key = (round(c.x, 4), round(c.y, 4), round(c.z, 4))
+                vis_vals[i] = vis_centers.get(key, 0.0)
+            attr = solid_mesh.attributes.new(name="_SG_FaceVisibility", type='FLOAT', domain='FACE')
+            attr.data.foreach_set("value", vis_vals.tolist())
+            print(f"[StableGen Make Solid] Stored _SG_FaceVisibility on {n_faces} faces")
+
         solid_mesh.calc_loop_triangles()
         print(f"[StableGen Make Solid] Total execution time: {time.perf_counter() - t_start:.4f}s")
         return solid_mesh
@@ -2420,6 +2735,10 @@ def _export_3mf_worker(is_dithered, filepath, palette_rgbs, solid_data, dithered
         channels_order = dithered_data["channels_order"]
         mesh_name = dithered_data["mesh_name"]
         cyan_idx = dithered_data["cyan_idx"]
+        dither_method = dithered_data.get("dither_method", "Z_SEQUENCE")
+        single_filament_internal = dithered_data.get("single_filament_internal", False)
+        internal_visibility_threshold = dithered_data.get("internal_visibility_threshold", 0.01)
+        face_visibility = dithered_data.get("face_visibility", None)
 
         status_dict["stage"] = "Scaling geometry"
         status_dict["progress"] = 5.0
@@ -2463,45 +2782,72 @@ def _export_3mf_worker(is_dithered, filepath, palette_rgbs, solid_data, dithered
                 r, g, b = round(color[0] * 255.0), round(color[1] * 255.0), round(color[2] * 255.0)
                 demands[idx] = decompose_subtractive(r, g, b, mode, palette_rgbs, channel_indices)
 
-        # Build dither sequences
-        status_dict["stage"] = "Building dither sequences"
-        status_dict["progress"] = 25.0
-
-        color_seqs = {}
         unique_colors_set = [tuple(round(c * 255.0) for c in color) for color in unique_colors_arr]
-        
-        for idx, color_key in enumerate(unique_colors_set):
-            if status_dict.get("cancel_requested", False):
-                return
-            row = demands[idx]
-            total = sum(max(0.0, d) for d in row)
-            seq = [0] * n_layers
-            
-            if total < 0.001:
-                if cyan_idx >= 0:
-                    nc = min(3, n_channels - cyan_idx)
-                    for li in range(n_layers):
-                        seq[li] = cyan_idx + (li % nc)
+
+        if dither_method == 'BLUE_NOISE':
+            status_dict["stage"] = "Building blue noise dither data"
+            status_dict["progress"] = 25.0
+
+            blue_noise_tile = _generate_blue_noise_tile(128)
+            bn_size = blue_noise_tile.shape[0]
+            bn_scale = 4.0
+            _off_rng = np.random.RandomState(98765)
+            layer_ox = _off_rng.randint(0, bn_size, size=n_layers).tolist()
+            layer_oy = _off_rng.randint(0, bn_size, size=n_layers).tolist()
+
+            color_cumdemands = {}
+            for idx, color_key in enumerate(unique_colors_set):
+                if status_dict.get("cancel_requested", False):
+                    return
+                row = demands[idx]
+                total = sum(max(0.0, d) for d in row)
+                if total < 0.001:
+                    color_cumdemands[color_key] = None
                 else:
+                    cum = []
+                    s = 0.0
+                    for d in row:
+                        s += max(0.0, d) / total
+                        cum.append(s)
+                    cum[-1] = 1.0
+                    color_cumdemands[color_key] = cum
+        else:
+            status_dict["stage"] = "Building dither sequences"
+            status_dict["progress"] = 25.0
+
+            color_seqs = {}
+            for idx, color_key in enumerate(unique_colors_set):
+                if status_dict.get("cancel_requested", False):
+                    return
+                row = demands[idx]
+                total = sum(max(0.0, d) for d in row)
+                seq = [0] * n_layers
+
+                if total < 0.001:
+                    if cyan_idx >= 0:
+                        nc = min(3, n_channels - cyan_idx)
+                        for li in range(n_layers):
+                            seq[li] = cyan_idx + (li % nc)
+                    else:
+                        for li in range(n_layers):
+                            seq[li] = li % n_channels
+                else:
+                    frac = [max(0.0, d) / total for d in row]
+                    placed = [0] * n_channels
                     for li in range(n_layers):
-                        seq[li] = li % n_channels
-            else:
-                frac = [max(0.0, d) / total for d in row]
-                placed = [0] * n_channels
-                for li in range(n_layers):
-                    best_ch = 0
-                    best_d = -float('inf')
-                    for ch in range(n_channels):
-                        if frac[ch] < 0.001:
-                            continue
-                        d = frac[ch] * (li + 1) - placed[ch]
-                        tie_break = d + ch * 1e-6 + (1e-7 if li % n_channels == ch else 0.0)
-                        if tie_break > best_d:
-                            best_d = tie_break
-                            best_ch = ch
-                    seq[li] = best_ch
-                    placed[best_ch] += 1
-            color_seqs[color_key] = seq
+                        best_ch = 0
+                        best_d = -float('inf')
+                        for ch in range(n_channels):
+                            if frac[ch] < 0.001:
+                                continue
+                            d = frac[ch] * (li + 1) - placed[ch]
+                            tie_break = d + ch * 1e-6 + (1e-7 if li % n_channels == ch else 0.0)
+                            if tie_break > best_d:
+                                best_d = tie_break
+                                best_ch = ch
+                        seq[li] = best_ch
+                        placed[best_ch] += 1
+                color_seqs[color_key] = seq
 
         # Slicing and clipping
         status_dict["stage"] = "Clipping layers"
@@ -2509,44 +2855,84 @@ def _export_3mf_worker(is_dithered, filepath, palette_rgbs, solid_data, dithered
 
         clipped_tris = []
         ZOFF = LH / 2
-        
+
         n_raw_tris = len(all_raw_tris)
         progress_step = max(1, n_raw_tris // 50)
 
         for fi in range(n_raw_tris):
             if status_dict.get("cancel_requested", False):
                 return
-                
+
             if fi % progress_step == 0:
-                pct = 35.0 + (fi / n_raw_tris) * 35.0  # maps to 35% - 70%
+                pct = 35.0 + (fi / n_raw_tris) * 35.0
                 status_dict["progress"] = pct
 
             t_idx = all_raw_tris[fi]
             v1, v2, v3 = scaled_verts[t_idx[0]], scaled_verts[t_idx[1]], scaled_verts[t_idx[2]]
             fz_min = min(v1[2], v2[2], v3[2])
             fz_max = max(v1[2], v2[2], v3[2])
-            
+
             tri = [list(v1), list(v2), list(v3)]
-            
+
             li_start = max(0, int(math.floor((fz_min - ZOFF) / LH)))
             li_end = min(n_layers - 1, int(math.ceil((fz_max - ZOFF) / LH)))
-            
+
             color_key = unique_keys[fi]
-            seq = color_seqs[color_key]
-            
-            if li_start == li_end or li_start >= n_layers:
-                cz = (fz_min + fz_max) / 2
-                li2 = max(0, min(n_layers - 1, int(math.floor((cz - ZOFF) / LH))))
-                clipped_tris.append((tri, seq[li2]))
+
+            if single_filament_internal and face_visibility is not None and fi < len(face_visibility) and face_visibility[fi] < internal_visibility_threshold:
+                internal_fi = n_channels - 1
+                if li_start == li_end or li_start >= n_layers:
+                    cz_c = (fz_min + fz_max) / 2
+                    li2 = max(0, min(n_layers - 1, int(math.floor((cz_c - ZOFF) / LH))))
+                    clipped_tris.append((tri, internal_fi))
+                else:
+                    for li in range(li_start, li_end + 1):
+                        if li >= n_layers:
+                            break
+                        zB = ZOFF + li * LH
+                        zT = ZOFF + (li + 1) * LH
+                        for st in cTZ(tri, zB, zT):
+                            clipped_tris.append((st, internal_fi))
+                continue
+
+            if dither_method == 'BLUE_NOISE':
+                cum = color_cumdemands.get(color_key)
+                if li_start == li_end or li_start >= n_layers:
+                    cz = (fz_min + fz_max) / 2
+                    li2 = max(0, min(n_layers - 1, int(math.floor((cz - ZOFF) / LH))))
+                    for ft, fi in _bn_assign_tri(tri, layer_ox[li2], layer_oy[li2],
+                                                  blue_noise_tile, bn_size, bn_scale,
+                                                  cum, n_channels, li2):
+                        clipped_tris.append((ft, fi))
+                else:
+                    for li in range(li_start, li_end + 1):
+                        if li >= n_layers:
+                            break
+                        zB = ZOFF + li * LH
+                        zT = ZOFF + (li + 1) * LH
+                        sub_tris = cTZ(tri, zB, zT)
+                        ox = layer_ox[li]
+                        oy = layer_oy[li]
+                        for st in sub_tris:
+                            for ft, fi in _bn_assign_tri(st, ox, oy,
+                                                          blue_noise_tile, bn_size, bn_scale,
+                                                          cum, n_channels, li):
+                                clipped_tris.append((ft, fi))
             else:
-                for li in range(li_start, li_end + 1):
-                    if li >= n_layers:
-                        break
-                    zB = ZOFF + li * LH
-                    zT = ZOFF + (li + 1) * LH
-                    sub_tris = cTZ(tri, zB, zT)
-                    for st in sub_tris:
-                        clipped_tris.append((st, seq[li]))
+                seq = color_seqs[color_key]
+                if li_start == li_end or li_start >= n_layers:
+                    cz = (fz_min + fz_max) / 2
+                    li2 = max(0, min(n_layers - 1, int(math.floor((cz - ZOFF) / LH))))
+                    clipped_tris.append((tri, seq[li2]))
+                else:
+                    for li in range(li_start, li_end + 1):
+                        if li >= n_layers:
+                            break
+                        zB = ZOFF + li * LH
+                        zT = ZOFF + (li + 1) * LH
+                        sub_tris = cTZ(tri, zB, zT)
+                        for st in sub_tris:
+                            clipped_tris.append((st, seq[li]))
 
         # Weld vertices
         status_dict["stage"] = "Welding vertices"
@@ -2865,6 +3251,7 @@ class Export3MF(bpy.types.Operator):
                 raw_verts_list = []
                 raw_tris_list = []
                 raw_face_colors_list = []
+                raw_face_vis_list = []
                 
                 for obj in self._meshes:
                     image = _find_texture_image(obj)
@@ -2905,12 +3292,27 @@ class Export3MF(bpy.types.Operator):
                         raw_verts_list.append(v_co)
                         raw_tris_list.append(t_idx + base_vi)
                         raw_face_colors_list.append(face_colors)
+
+                        fv_attr = temp.attributes.get("_SG_FaceVisibility")
+                        if fv_attr is not None and fv_attr.domain == 'FACE':
+                            n_polys = len(temp.polygons)
+                            poly_vis = np.zeros(n_polys, dtype=np.float32)
+                            fv_attr.data.foreach_get("value", poly_vis.tolist())
+                            n_tris_fv = len(temp.loop_triangles)
+                            tri_poly = np.empty(n_tris_fv, dtype=np.int32)
+                            temp.loop_triangles.foreach_get("polygon_index", tri_poly)
+                            raw_face_vis_list.append(poly_vis[tri_poly])
+                        else:
+                            fv = _collect_face_visibility(temp)
+                            raw_face_vis_list.append(fv if fv is not None else np.full(len(t_idx), -1.0, dtype=np.float32))
                     finally:
                         eval_obj.to_mesh_clear()
                             
                 all_raw_verts = np.concatenate(raw_verts_list, axis=0)
                 all_raw_tris = np.concatenate(raw_tris_list, axis=0)
                 all_raw_face_colors = np.concatenate(raw_face_colors_list, axis=0)
+                all_raw_face_vis = np.concatenate(raw_face_vis_list, axis=0)
+                has_face_vis = bool(np.any(all_raw_face_vis >= 0.0))
                 
                 h_target = scene.stablegen_print_model_height
                 LH = scene.stablegen_print_layer_height
@@ -2951,6 +3353,10 @@ class Export3MF(bpy.types.Operator):
                     "channels_order": channels_order,
                     "mesh_name": self._meshes[0].name,
                     "cyan_idx": cyan_idx,
+                    "dither_method": getattr(scene, "stablegen_print_dither_method", "Z_SEQUENCE"),
+                    "single_filament_internal": getattr(scene, "stablegen_print_single_filament_internal", True),
+                    "internal_visibility_threshold": getattr(scene, "stablegen_print_internal_visibility_threshold", 0.01),
+                    "face_visibility": all_raw_face_vis if has_face_vis else None,
                     "solver_settings": {
                         "init_method": getattr(scene, "stablegen_print_solver_init", 'CLOSEST'),
                         "iterations": getattr(scene, "stablegen_print_solver_steps", 80),
@@ -3014,11 +3420,19 @@ class Export3MF(bpy.types.Operator):
                     
                     visible_faces_results = status["visible_faces_results"]
                     fill_gaps = getattr(context.scene, "stablegen_print_fill_gaps", True)
+                    keep_largest = getattr(context.scene, "stablegen_print_keep_largest_island", True)
                     
                     try:
                         for idx, obj in enumerate(self._meshes):
                             vis_faces = visible_faces_results[idx]
-                            solid_mesh = _make_solid_mesh_object(obj, fill_gaps=fill_gaps, visible_faces=vis_faces)
+                            face_vis = None
+                            if getattr(context.scene, "stablegen_print_single_filament_internal", True):
+                                temp_ms, eval_ms = _get_triangulated_mesh(obj, apply_transforms=False)
+                                try:
+                                    face_vis = _collect_face_visibility(temp_ms)
+                                finally:
+                                    eval_ms.to_mesh_clear()
+                            solid_mesh = _make_solid_mesh_object(obj, fill_gaps=fill_gaps, keep_largest_island=keep_largest, visible_faces=vis_faces, face_visibility=face_vis)
                             self._temp_solid_meshes.append(solid_mesh)
                             
                             self._solidified_mappings[obj] = (obj.data, solid_mesh)

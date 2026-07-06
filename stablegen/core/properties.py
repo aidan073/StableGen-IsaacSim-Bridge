@@ -92,6 +92,15 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=True,
         update=update_print_dithered,
     )
+    bpy.types.Scene.stablegen_print_dither_method = bpy.props.EnumProperty(
+        name="Dither Method",
+        description="Z-Sequence distributes filaments along Z-axis layers (minimal tool changes but visible banding on flat surfaces). Blue Noise uses spatial 3D dithering with a blue noise mask for smoother color transitions but may increase tool changes per layer on mixed-color regions",
+        items=[
+            ('Z_SEQUENCE', 'Z-Sequence', 'Original method: Bresenham-like filament distribution along Z layers. Minimal tool changes, may show horizontal banding on flat surfaces'),
+            ('BLUE_NOISE', 'Blue Noise', 'Spatial 3D dithering using a clustered blue noise mask. Smoother perceived color on flat surfaces, may increase tool changes per layer on FDM toolchangers'),
+        ],
+        default='Z_SEQUENCE',
+    )
     bpy.types.Scene.stablegen_print_layer_height = bpy.props.FloatProperty(
         name="Layer Height",
         description="Layer height in mm",
@@ -121,6 +130,21 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Raycast Angles",
         description="Number of angular sample directions around the bounding cylinder per height level (5 height levels are tested). Higher values help preserve narrow crevices but increase calculation time",
         default=12, min=4, max=64,
+    )
+    bpy.types.Scene.stablegen_print_keep_largest_island = bpy.props.BoolProperty(
+        name="Keep Largest Island",
+        description="After the visibility cleanup, keep only the largest connected piece of geometry and discard any smaller disconnected islands (e.g. interior skin the raycast missed). Runs before the gap-filling step",
+        default=True,
+    )
+    bpy.types.Scene.stablegen_print_single_filament_internal = bpy.props.BoolProperty(
+        name="Single Filament Internal",
+        description="Use a single filament for faces that were not seen by any texturing projection camera (low visibility weight). Reduces tool changes on FDM toolchangers for non-visible areas. Requires visibility weights to be baked (Bake Visibility option in texturing pipeline)",
+        default=True,
+    )
+    bpy.types.Scene.stablegen_print_internal_visibility_threshold = bpy.props.FloatProperty(
+        name="Visibility Threshold",
+        description="Faces with total projection visibility weight below this value are treated as internal and get a single filament. 0.0 = only completely unseen faces, higher values = more faces treated as internal",
+        default=0.01, min=0.0, max=1.0, step=0.01, precision=3,
     )
     bpy.types.Scene.stablegen_print_show_advanced = bpy.props.BoolProperty(
         name="Show Advanced Settings",
@@ -1844,6 +1868,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         del bpy.types.Scene.stablegen_print_preset
     if hasattr(bpy.types.Scene, 'stablegen_print_dithered'):
         del bpy.types.Scene.stablegen_print_dithered
+    if hasattr(bpy.types.Scene, 'stablegen_print_dither_method'):
+        del bpy.types.Scene.stablegen_print_dither_method
     if hasattr(bpy.types.Scene, 'stablegen_print_layer_height'):
         del bpy.types.Scene.stablegen_print_layer_height
     if hasattr(bpy.types.Scene, 'stablegen_print_model_height'):
@@ -1856,6 +1882,12 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         del bpy.types.Scene.stablegen_print_make_solid
     if hasattr(bpy.types.Scene, 'stablegen_print_raycast_count'):
         del bpy.types.Scene.stablegen_print_raycast_count
+    if hasattr(bpy.types.Scene, 'stablegen_print_keep_largest_island'):
+        del bpy.types.Scene.stablegen_print_keep_largest_island
+    if hasattr(bpy.types.Scene, 'stablegen_print_single_filament_internal'):
+        del bpy.types.Scene.stablegen_print_single_filament_internal
+    if hasattr(bpy.types.Scene, 'stablegen_print_internal_visibility_threshold'):
+        del bpy.types.Scene.stablegen_print_internal_visibility_threshold
     if hasattr(bpy.types.Scene, 'stablegen_print_show_advanced'):
         del bpy.types.Scene.stablegen_print_show_advanced
     if hasattr(bpy.types.Scene, 'stablegen_print_solver_init'):

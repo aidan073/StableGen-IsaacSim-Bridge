@@ -845,6 +845,12 @@ class SG_OT_DebugMakeSolid(bpy.types.Operator):
         default=True,
     )
 
+    keep_largest_island: bpy.props.BoolProperty(
+        name="Keep Largest Island",
+        description="After the visibility cleanup, keep only the largest connected piece of geometry and discard any smaller disconnected islands (e.g. interior skin the raycast missed). Runs before the gap-filling step",
+        default=True,
+    )
+
     @classmethod
     def poll(cls, context):
         prefs = context.preferences.addons.get(__package__)
@@ -918,7 +924,7 @@ class SG_OT_DebugMakeSolid(bpy.types.Operator):
             obj.select_set(True)
             context.view_layer.objects.active = obj
 
-            solid_mesh = _make_solid_mesh_object(obj, fill_gaps=self.fill_gaps)
+            solid_mesh = _make_solid_mesh_object(obj, fill_gaps=self.fill_gaps, keep_largest_island=self.keep_largest_island)
 
             # Replace the mesh of the object
             old_mesh = obj.data

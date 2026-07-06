@@ -2149,10 +2149,10 @@ class StableGenPrintPanel(bpy.types.Panel):
         row.prop(scene, "stablegen_print_dithered", text="Dithered (Full Spectrum)")
         
         if scene.stablegen_print_dithered:
-            row = box.row()
-            row.prop(scene, "stablegen_print_model_height", text="Model Height (mm)")
-            row = box.row()
-            row.prop(scene, "stablegen_print_layer_height", text="Layer Height (mm)")
+            dither_box = box.box()
+            dither_box.prop(scene, "stablegen_print_dither_method", text="Method")
+            dither_box.prop(scene, "stablegen_print_model_height", text="Model Height (mm)")
+            dither_box.prop(scene, "stablegen_print_layer_height", text="Layer Height (mm)")
             
         row = box.row()
         row.prop(scene, "stablegen_print_smoothing", text="Island Cleanup", slider=True)
@@ -2163,8 +2163,12 @@ class StableGenPrintPanel(bpy.types.Panel):
         row = box.row()
         row.prop(scene, "stablegen_print_make_solid", text="Make Solid", icon="MOD_REMESH")
         if scene.stablegen_print_make_solid:
-            row = box.row()
-            row.prop(scene, "stablegen_print_raycast_count", text="Raycast Angles")
+            solid_box = box.box()
+            solid_box.prop(scene, "stablegen_print_raycast_count", text="Raycast Angles")
+            solid_box.prop(scene, "stablegen_print_keep_largest_island", text="Keep Largest Island", icon="MESH_ICOSPHERE")
+            solid_box.prop(scene, "stablegen_print_single_filament_internal", text="Single Filament Internal")
+            if scene.stablegen_print_single_filament_internal:
+                solid_box.prop(scene, "stablegen_print_internal_visibility_threshold", text="Visibility Threshold", slider=True)
 
         # Advanced Solver Settings
         row = box.row()
