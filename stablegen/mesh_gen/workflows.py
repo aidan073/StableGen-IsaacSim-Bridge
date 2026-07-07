@@ -1,10 +1,13 @@
 import os
 import json
+import email.utils
+import posixpath
+import re
 import uuid
 import websocket
 import urllib.request
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from ..timeout_config import get_timeout
 from ..utils import get_generation_dirs
@@ -121,6 +124,500 @@ class _Trellis2WorkflowMixin:
         """Return True if server_address points to localhost."""
         host = server_address.split(':')[0].strip()
         return host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1', '')
+
+    @staticmethod
+    def _is_trellis2_mesh_output(value):
+        """Return True when *value* looks like a TRELLIS.2 mesh output file."""
+        return isinstance(value, str) and value.lower().endswith(('.glb', '.obj', '.ply'))
+
+    @classmethod
+    def _extract_trellis2_file_refs(cls, value):
+        """Collect mesh output references from nested ComfyUI output metadata."""
+        refs = []
+        seen = set()
+
+        def add_ref(ref):
+            path = ref.get('path', '')
+            filename = ref.get('filename', '')
+            if path and not cls._is_trellis2_mesh_output(path):
+                return
+            if filename and not cls._is_trellis2_mesh_output(filename):
+                return
+            if not path and not filename:
+                return
+
+            key = (
+                path,
+                filename,
+                ref.get('subfolder', ''),
+                ref.get('type', 'output'),
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            refs.append(ref)
+
+        def visit(item):
+            if isinstance(item, str):
+                text = item.strip()
+                if cls._is_trellis2_mesh_output(text):
+                    add_ref({'path': text})
+                return
+
+            if isinstance(item, dict):
+                filename = item.get('filename') or item.get('name')
+                if isinstance(filename, str):
+                    filename = filename.strip()
+                    if cls._is_trellis2_mesh_output(filename):
+                        add_ref({
+                            'filename': filename,
+                            'subfolder': str(item.get('subfolder') or ''),
+                            'type': str(item.get('type') or 'output'),
+                        })
+
+                for key, child in item.items():
+                    if key in ('filename', 'name', 'subfolder', 'type'):
+                        continue
+                    visit(child)
+                return
+
+            if isinstance(item, (list, tuple)):
+                for child in item:
+                    visit(child)
+
+        visit(value)
+        return refs
+
+    @staticmethod
+    def _path_looks_absolute(path):
+        """Return True for POSIX or Windows absolute-looking paths."""
+        normalized = path.replace('\\', '/')
+        return (
+            os.path.isabs(path)
+            or normalized.startswith('/')
+            or (len(normalized) > 1 and normalized[1] == ':')
+        )
+
+    @classmethod
+    def _comfyui_view_url_for_file_ref(cls, server_address, ref):
+        """Build a ComfyUI /view URL from a file reference."""
+        filename = ref.get('filename') or ''
+        subfolder = ref.get('subfolder') or ''
+        file_type = ref.get('type') or 'output'
+
+        if not filename:
+            path = ref.get('path') or ''
+            if not path:
+                return None
+            normalized = path.replace('\\', '/')
+            filename = posixpath.basename(normalized)
+            if not cls._path_looks_absolute(path):
+                subfolder = posixpath.dirname(normalized)
+
+        if not filename:
+            return None
+
+        params = {
+            'filename': filename,
+            'subfolder': subfolder,
+            'type': file_type,
+        }
+        return f"http://{server_address}/view?{urllib.parse.urlencode(params)}"
+
+    @staticmethod
+    def _describe_trellis2_file_ref(ref):
+        if ref.get('path'):
+            return ref['path']
+        subfolder = ref.get('subfolder') or ''
+        filename = ref.get('filename') or ''
+        return f"{subfolder}/{filename}" if subfolder else filename
+
+    @staticmethod
+    def _normalize_trellis2_timezone_offset(offset):
+        """Round and validate a timezone offset."""
+        if offset is None:
+            return None
+
+        total_seconds = offset.total_seconds()
+        if abs(total_seconds) > 14 * 60 * 60:
+            return None
+
+        # Real-world timezone offsets are 15-minute aligned; inferred offsets
+        # can be off by a few seconds because filenames and mtimes are not
+        # atomic, so snap to timezone granularity instead of preserving jitter.
+        return timedelta(minutes=round(total_seconds / (15 * 60.0)) * 15)
+
+    @classmethod
+    def _parse_trellis2_timezone_offset(cls, value, reference_utc=None):
+        """Parse a server-provided timezone name or UTC offset."""
+        if value is None or isinstance(value, bool):
+            return None
+
+        if isinstance(value, (int, float)):
+            number = float(value)
+            if abs(number) <= 14:
+                seconds = number * 60 * 60
+            elif abs(number) <= 14 * 60:
+                seconds = number * 60
+            elif abs(number) <= 14 * 60 * 60:
+                seconds = number
+            else:
+                return None
+            return cls._normalize_trellis2_timezone_offset(timedelta(seconds=seconds))
+
+        if not isinstance(value, str):
+            return None
+
+        text = value.strip()
+        if not text:
+            return None
+
+        upper = text.upper()
+        if upper in ('UTC', 'GMT', 'Z'):
+            return timedelta(0)
+
+        match = re.search(
+            r'(?:UTC|GMT)?\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?',
+            text,
+            re.IGNORECASE,
+        )
+        if match:
+            sign = -1 if match.group(1) == '-' else 1
+            hours = int(match.group(2))
+            minutes = int(match.group(3) or '0')
+            if hours <= 14 and minutes < 60:
+                return cls._normalize_trellis2_timezone_offset(
+                    timedelta(minutes=sign * (hours * 60 + minutes))
+                )
+
+        try:
+            from zoneinfo import ZoneInfo
+
+            base = reference_utc or datetime.now(timezone.utc)
+            if base.tzinfo is None:
+                base = base.replace(tzinfo=timezone.utc)
+            offset = base.astimezone(ZoneInfo(text)).utcoffset()
+            return cls._normalize_trellis2_timezone_offset(offset)
+        except Exception:
+            return None
+
+    @classmethod
+    def _extract_trellis2_timezone_offsets(cls, value, reference_utc=None):
+        """Collect explicit timezone offsets from nested server metadata."""
+        offsets = []
+        seen = set()
+
+        def add(offset):
+            offset = cls._normalize_trellis2_timezone_offset(offset)
+            if offset is None:
+                return
+            key = int(offset.total_seconds())
+            if key in seen:
+                return
+            seen.add(key)
+            offsets.append(offset)
+
+        def key_looks_timezone_related(key):
+            key = key.lower().replace('-', '_')
+            return (
+                key in (
+                    'timezone',
+                    'time_zone',
+                    'tz',
+                    'tzname',
+                    'utc_offset',
+                    'gmt_offset',
+                    'timezone_offset',
+                    'server_timezone',
+                    'server_tz',
+                    'server_utc_offset',
+                )
+                or key.endswith('_timezone')
+                or key.endswith('_utc_offset')
+                or key.endswith('_gmt_offset')
+            )
+
+        def visit(item):
+            if isinstance(item, dict):
+                for key, child in item.items():
+                    if isinstance(key, str) and key_looks_timezone_related(key):
+                        add(cls._parse_trellis2_timezone_offset(child, reference_utc))
+                    visit(child)
+            elif isinstance(item, (list, tuple)):
+                for child in item:
+                    visit(child)
+
+        visit(value)
+        return offsets
+
+    @staticmethod
+    def _timestamp_from_trellis2_file_ref(ref):
+        filename = ref.get('filename') or ''
+        if not filename and ref.get('path'):
+            filename = posixpath.basename(ref['path'].replace('\\', '/'))
+
+        match = re.search(
+            r'_(\d{8}_\d{6})\.(?:glb|obj|ply)$',
+            filename,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+
+        try:
+            return datetime.strptime(match.group(1), '%Y%m%d_%H%M%S')
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _get_trellis2_view_last_modified(view_url):
+        """Return the Last-Modified header from a ComfyUI /view URL."""
+        request_attempts = [
+            urllib.request.Request(view_url, method='HEAD'),
+            urllib.request.Request(view_url, headers={'Range': 'bytes=0-0'}),
+        ]
+
+        for req in request_attempts:
+            try:
+                with urllib.request.urlopen(req, timeout=get_timeout('api')) as response:
+                    modified_header = response.headers.get('Last-Modified')
+                    if modified_header:
+                        return modified_header
+            except Exception:
+                continue
+
+        return None
+
+    @classmethod
+    def _infer_trellis2_timezone_offsets_from_history(cls, server_address, history):
+        """Infer server-local UTC offsets from output filenames and mtimes."""
+        offsets = []
+        seen_offsets = set()
+        seen_urls = set()
+        attempted = 0
+        checked = 0
+
+        for file_ref in cls._extract_trellis2_file_refs(history):
+            if attempted >= 16 or checked >= 8:
+                break
+
+            local_timestamp = cls._timestamp_from_trellis2_file_ref(file_ref)
+            if local_timestamp is None:
+                continue
+
+            view_url = cls._comfyui_view_url_for_file_ref(server_address, file_ref)
+            if not view_url or view_url in seen_urls:
+                continue
+            seen_urls.add(view_url)
+            attempted += 1
+
+            try:
+                modified_header = cls._get_trellis2_view_last_modified(view_url)
+                if not modified_header:
+                    continue
+
+                modified = email.utils.parsedate_to_datetime(modified_header)
+                if modified.tzinfo is None:
+                    modified = modified.replace(tzinfo=timezone.utc)
+                modified_utc = modified.astimezone(timezone.utc).replace(tzinfo=None)
+
+                offset = cls._normalize_trellis2_timezone_offset(local_timestamp - modified_utc)
+                if offset is None:
+                    continue
+                key = int(offset.total_seconds())
+                if key in seen_offsets:
+                    continue
+                seen_offsets.add(key)
+                offsets.append(offset)
+            except Exception:
+                continue
+
+            checked += 1
+
+        return offsets
+
+    @staticmethod
+    def _get_trellis2_prompt_completion_utc(history_entry):
+        """Return the prompt completion timestamp as naive UTC."""
+        try:
+            messages = history_entry.get('status', {}).get('messages', [])
+            timestamp_ms = None
+            for message in messages:
+                if (
+                    isinstance(message, (list, tuple))
+                    and len(message) >= 2
+                    and message[0] == 'execution_success'
+                    and isinstance(message[1], dict)
+                ):
+                    timestamp_ms = message[1].get('timestamp')
+                    break
+
+            if timestamp_ms is None and messages:
+                last_message = messages[-1]
+                if isinstance(last_message, (list, tuple)) and len(last_message) >= 2:
+                    timestamp_ms = last_message[1].get('timestamp')
+
+            if timestamp_ms is None:
+                return None
+
+            return datetime.fromtimestamp(
+                float(timestamp_ms) / 1000.0,
+                timezone.utc,
+            ).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_trellis2_output_text(history_entry, node_id):
+        """Extract a string output from a ComfyUI history entry."""
+        try:
+            output = history_entry.get('outputs', {}).get(node_id, {})
+            for key in ('text', 'STRING', 'string', 'value'):
+                value = output.get(key)
+                if isinstance(value, list) and value:
+                    value = value[0]
+                if isinstance(value, str) and value:
+                    return value
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _fetch_trellis2_server_time_string_offset(cls, server_address):
+        """Ask a lightweight ComfyUI time node for server-local time."""
+        try:
+            object_info = json.loads(urllib.request.urlopen(
+                f"http://{server_address}/object_info",
+                timeout=get_timeout('api'),
+            ).read())
+            if (
+                'Time String (WLSH)' not in object_info
+                or 'ShowText|pysssss' not in object_info
+            ):
+                return None
+
+            body = json.dumps({
+                'client_id': str(uuid.uuid4()),
+                'prompt': {
+                    '1': {
+                        'class_type': 'Time String (WLSH)',
+                        'inputs': {'style': '%Y-%m-%d-%H%M%S'},
+                    },
+                    '2': {
+                        'class_type': 'ShowText|pysssss',
+                        'inputs': {'text': ['1', 0]},
+                    },
+                },
+            }).encode('utf-8')
+            req = urllib.request.Request(
+                f"http://{server_address}/prompt",
+                data=body,
+                method='POST',
+                headers={'Content-Type': 'application/json'},
+            )
+            queued = json.loads(urllib.request.urlopen(
+                req,
+                timeout=get_timeout('api'),
+            ).read())
+            prompt_id = queued.get('prompt_id')
+            if not prompt_id:
+                return None
+
+            import time
+
+            history_entry = None
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                history = json.loads(urllib.request.urlopen(
+                    f"http://{server_address}/history/{urllib.parse.quote(prompt_id)}",
+                    timeout=get_timeout('api'),
+                ).read())
+                history_entry = history.get(prompt_id)
+                if history_entry:
+                    completed = history_entry.get('status', {}).get('completed')
+                    if completed:
+                        break
+                time.sleep(0.2)
+
+            if not history_entry:
+                return None
+
+            server_local_text = cls._extract_trellis2_output_text(history_entry, '2')
+            if not server_local_text:
+                return None
+
+            server_local = datetime.strptime(server_local_text, '%Y-%m-%d-%H%M%S')
+            completed_utc = cls._get_trellis2_prompt_completion_utc(history_entry)
+            if completed_utc is None:
+                return None
+
+            return cls._normalize_trellis2_timezone_offset(server_local - completed_utc)
+        except Exception as e:
+            print(f"[TRELLIS2] Server timezone probe via Time String failed: {e}")
+            return None
+
+    @classmethod
+    def _fetch_trellis2_server_timezone_offsets(cls, server_address, reference_utc=None):
+        """Fetch or infer actual ComfyUI server-local UTC offsets."""
+        offsets = []
+        seen = set()
+
+        def add(source, offset):
+            offset = cls._normalize_trellis2_timezone_offset(offset)
+            if offset is None:
+                return
+            key = int(offset.total_seconds())
+            if key in seen:
+                return
+            seen.add(key)
+            offsets.append((source, offset))
+
+        try:
+            req = urllib.request.Request(
+                f"http://{server_address}/system_stats",
+                method='GET',
+            )
+            with urllib.request.urlopen(req, timeout=get_timeout('api')) as response:
+                headers = response.headers
+                body = response.read()
+
+            for key in (
+                'X-Server-Timezone',
+                'X-Timezone',
+                'Timezone',
+                'X-Server-UTC-Offset',
+                'X-UTC-Offset',
+                'X-Timezone-Offset',
+                'X-GMT-Offset',
+            ):
+                add(
+                    f"header:{key}",
+                    cls._parse_trellis2_timezone_offset(headers.get(key), reference_utc),
+                )
+
+            try:
+                system_stats = json.loads(body.decode('utf-8'))
+                for offset in cls._extract_trellis2_timezone_offsets(system_stats, reference_utc):
+                    add('system_stats', offset)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[TRELLIS2] Server timezone fetch from /system_stats failed: {e}")
+
+        if not offsets:
+            add('time-string-prompt', cls._fetch_trellis2_server_time_string_offset(server_address))
+
+        if not offsets:
+            try:
+                history_url = f"http://{server_address}/history"
+                history = json.loads(urllib.request.urlopen(
+                    history_url, timeout=get_timeout('api')).read())
+                for offset in cls._infer_trellis2_timezone_offsets_from_history(server_address, history):
+                    add('history+last-modified', offset)
+            except Exception as e:
+                print(f"[TRELLIS2] Server timezone inference from history failed: {e}")
+
+        return offsets
 
     def generate_trellis2(self, context, input_image_path):
         """
@@ -384,7 +881,7 @@ class _Trellis2WorkflowMixin:
             # Wait for execution to complete via WebSocket
             # Also capture 'executed' events which may contain the output path
             export_node_id = NODES[export_node_key]
-            glb_output_path = None
+            glb_output_refs = []
 
             # Friendly node labels for the progress bars
             NODE_LABELS = {
@@ -487,24 +984,13 @@ class _Trellis2WorkflowMixin:
                         if data.get('node') == export_node_id:
                             ws_output = data.get('output', {})
                             if ws_output:
-                                for key in ['glb_path', 'file_path', 'text', 'string']:
-                                    val = ws_output.get(key)
-                                    if val:
-                                        if isinstance(val, list) and len(val) > 0:
-                                            val = val[0]
-                                        if isinstance(val, str) and val:
-                                            glb_output_path = val
-                                            print(f"[TRELLIS2] Got path from WS executed event: {glb_output_path}")
-                                            break
-                                # Also check any key with a file-like value
-                                if not glb_output_path:
-                                    for key, val in ws_output.items():
-                                        if isinstance(val, list) and len(val) > 0:
-                                            val = val[0]
-                                        if isinstance(val, str) and val.endswith(('.glb', '.obj', '.ply')):
-                                            glb_output_path = val
-                                            print(f"[TRELLIS2] Got path from WS (key={key}): {glb_output_path}")
-                                            break
+                                refs = self._extract_trellis2_file_refs(ws_output)
+                                if refs:
+                                    glb_output_refs.extend(refs)
+                                    print(
+                                        "[TRELLIS2] Got file reference from WS "
+                                        f"executed event: {self._describe_trellis2_file_ref(refs[0])}"
+                                    )
 
                     elif message['type'] == 'progress':
                         # Within-node progress (sampler steps).
@@ -629,63 +1115,59 @@ class _Trellis2WorkflowMixin:
         # Strategy 4: HTTP download via /view endpoint
         # Strategy 5: scan ComfyUI output dir for our prefix
 
-        glb_source_path = glb_output_path  # May already be set from WS event
+        glb_file_refs = list(glb_output_refs)  # May already be set from WS event
+        prompt_history_entry = None
 
         # Helper: bail early when the user hits Cancel
         def _cancelled():
             return getattr(self.operator, '_cancelled', False)
 
         # Strategy 2: Query history for the output path
-        if not glb_source_path and not _cancelled():
+        if not glb_file_refs and not _cancelled():
             try:
                 history_url = f"http://{server_address}/history/{prompt_id}"
                 history_response = json.loads(urllib.request.urlopen(
                     history_url, timeout=get_timeout('api')).read())
 
                 if prompt_id in history_response:
+                    prompt_history_entry = history_response[prompt_id]
                     outputs = history_response[prompt_id].get("outputs", {})
                     export_output = outputs.get(export_node_id, {})
                     print(f"[TRELLIS2] History output for node {export_node_id}: {export_output}")
 
-                    for key in ['glb_path', 'file_path', 'text', 'string']:
-                        val = export_output.get(key)
-                        if val:
-                            if isinstance(val, list) and len(val) > 0:
-                                val = val[0]
-                            if isinstance(val, str) and val:
-                                glb_source_path = val
-                                print(f"[TRELLIS2] Got path from history (key={key}): {glb_source_path}")
-                                break
-
-                    # Check any key with a path-like value
-                    if not glb_source_path:
-                        for key, val in export_output.items():
-                            if isinstance(val, list) and len(val) > 0:
-                                val = val[0]
-                            if isinstance(val, str) and val.endswith(('.glb', '.obj', '.ply')):
-                                glb_source_path = val
-                                print(f"[TRELLIS2] Got path from history (key={key}): {glb_source_path}")
-                                break
+                    glb_file_refs = self._extract_trellis2_file_refs(export_output)
+                    if glb_file_refs:
+                        print(
+                            "[TRELLIS2] Got file reference from history: "
+                            f"{self._describe_trellis2_file_ref(glb_file_refs[0])}"
+                        )
             except Exception as e:
                 print(f"[TRELLIS2] History query failed: {e}")
 
         # Strategy 3: Read directly from disk (works when ComfyUI is local)
-        if glb_source_path and not _cancelled() and os.path.isfile(glb_source_path):
-            try:
-                print(f"[TRELLIS2] Reading GLB directly from disk: {glb_source_path}")
-                with open(glb_source_path, 'rb') as f:
-                    glb_data = f.read()
-                print(f"[TRELLIS2] Read {len(glb_data)} bytes from disk")
-                if glb_data and len(glb_data) > 0:
-                    return glb_data
-            except Exception as e:
-                print(f"[TRELLIS2] Direct file read failed: {e}")
+        for file_ref in glb_file_refs:
+            if _cancelled():
+                return {"error": "cancelled"}
+            glb_source_path = file_ref.get('path')
+            if glb_source_path and os.path.isfile(glb_source_path):
+                try:
+                    print(f"[TRELLIS2] Reading GLB directly from disk: {glb_source_path}")
+                    with open(glb_source_path, 'rb') as f:
+                        glb_data = f.read()
+                    print(f"[TRELLIS2] Read {len(glb_data)} bytes from disk")
+                    if glb_data and len(glb_data) > 0:
+                        return glb_data
+                except Exception as e:
+                    print(f"[TRELLIS2] Direct file read failed: {e}")
 
         # Strategy 4: HTTP download via /view endpoint
-        if glb_source_path and not _cancelled():
-            glb_filename = os.path.basename(glb_source_path)
+        for file_ref in glb_file_refs:
+            if _cancelled():
+                return {"error": "cancelled"}
+            view_url = self._comfyui_view_url_for_file_ref(server_address, file_ref)
+            if not view_url:
+                continue
             try:
-                view_url = f"http://{server_address}/view?filename={urllib.parse.quote(glb_filename)}&type=output"
                 print(f"[TRELLIS2] Downloading GLB via HTTP: {view_url}")
                 glb_response = urllib.request.urlopen(view_url, timeout=get_timeout('transfer'))
                 glb_data = glb_response.read()
@@ -762,20 +1244,70 @@ class _Trellis2WorkflowMixin:
             scan_timeout = max(1.0, scan_timeout / 2.0)
 
         clock_offset = getattr(self, '_clock_offset', timedelta(0))
-        now_local = datetime.now() + clock_offset
-        candidates = [now_local]
-        if is_remote:
-            clock_offset_utc = getattr(self, '_clock_offset_utc', None)
-            if clock_offset_utc is not None:
-                now_utc = datetime.now() + clock_offset_utc
-                if abs((now_utc - now_local).total_seconds()) > 5:
-                    candidates.append(now_utc)
+        server_utc_now = datetime.now(timezone.utc).replace(tzinfo=None) + clock_offset
+        reference_utc = server_utc_now.replace(tzinfo=timezone.utc)
+        prompt_completion_utc = self._get_trellis2_prompt_completion_utc(prompt_history_entry)
+        timestamp_utc_base = prompt_completion_utc or server_utc_now
+        client_utc_now = datetime.now(timezone.utc).replace(tzinfo=None)
+        client_local_offset = datetime.now() - client_utc_now
+        candidate_bases = []
+
+        def add_candidate_base(label, value):
+            for _existing_label, existing_value in candidate_bases:
+                if abs((value - existing_value).total_seconds()) <= 1:
+                    return
+            candidate_bases.append((label, value))
+
+        if prompt_completion_utc:
+            print(
+                "[TRELLIS2] Timestamp scan using prompt completion UTC: "
+                f"{prompt_completion_utc.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+
+        add_candidate_base('client-local', timestamp_utc_base + client_local_offset)
+        add_candidate_base('utc', timestamp_utc_base)
+        if prompt_completion_utc:
+            add_candidate_base('current-client-local', datetime.now() + clock_offset)
+            add_candidate_base('current-utc', server_utc_now)
+
+        server_timezone_offsets = self._fetch_trellis2_server_timezone_offsets(
+            server_address,
+            reference_utc,
+        )
+        if server_timezone_offsets:
+            print(
+                "[TRELLIS2] Server timezone candidates: "
+                + ", ".join(
+                    f"{source}=UTC{offset.total_seconds() / 3600.0:+.2f}"
+                    for source, offset in server_timezone_offsets
+                )
+            )
+            for source, offset in server_timezone_offsets:
+                hours = offset.total_seconds() / 3600.0
+                add_candidate_base(
+                    f'server-local({source}, UTC{hours:+.2f})',
+                    timestamp_utc_base + offset,
+                )
+        else:
+            print(
+                "[TRELLIS2] Server timezone was not exposed by ComfyUI "
+                "and could not be inferred from history metadata"
+            )
+
+        print(
+            "[TRELLIS2] Timestamp scan candidate clocks: "
+            + ", ".join(label for label, _value in candidate_bases)
+        )
 
         for delta_seconds in range(0, scan_range):
             if _cancelled():
                 return {"error": "cancelled"}
-            for delta in [timedelta(seconds=-delta_seconds), timedelta(seconds=delta_seconds)]:
-                for base_now in candidates:
+            deltas = [timedelta(0)] if delta_seconds == 0 else [
+                timedelta(seconds=-delta_seconds),
+                timedelta(seconds=delta_seconds),
+            ]
+            for delta in deltas:
+                for _label, base_now in candidate_bases:
                     candidate_time = base_now + delta
                     candidate_name = f"{unique_prefix}_{candidate_time.strftime('%Y%m%d_%H%M%S')}.glb"
                     try:
@@ -797,4 +1329,3 @@ class _Trellis2WorkflowMixin:
             f"Prefix: {unique_prefix}"
         )
         return {"error": self.operator._error}
-
